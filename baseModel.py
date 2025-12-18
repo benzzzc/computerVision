@@ -4,43 +4,36 @@ from tensorflow.keras.applications import EfficientNetB0
 from tensorflow.keras.callbacks import EarlyStopping
 import matplotlib.pyplot as plt 
 import os
-from sklearn.utils import class_weight
 import numpy as np
+from sklearn.utils import class_weight 
 
 # --- PATH CONFIGURATION ---
-# 1. Get the folder where this script lives
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 2. Define the Dataset Root
-# Note: Keeping your spelling 'prcessed' to match previous steps
+# Define the Dataset Root
 DATASET_ROOT = os.path.join(SCRIPT_DIR, "prcessed_dataset_05_12_2025_pt2")
 
-# 3. Define Train and Validation/Test folders specifically
 TRAIN_DIR = os.path.join(DATASET_ROOT, "train")
 
-# IMPORTANT: Ensure you have a 'test' or 'val' folder in your processed dataset!
-# If your folder is named 'val', change "test" to "val" below.
+# CHANGED: Pointing to the 'test' folder
 TEST_DIR = os.path.join(DATASET_ROOT, "test") 
 
 IMG_SIZE = 224
 BATCH_SIZE = 32
-NUM_CLASSES = 3 
 EPOCHS = 20
 
-# --- VALIDATION CHECK ---
+# --- FOLDER CHECK ---
 if not os.path.exists(TRAIN_DIR):
     print(f"ERROR: Training folder not found at: {TRAIN_DIR}")
     exit()
 if not os.path.exists(TEST_DIR):
-    print(f"WARNING: Validation folder not found at: {TEST_DIR}")
-    print("Please make sure you have processed your 'test' or 'val' split using the ImageProcessing script.")
-    # We exit here because the model needs validation data to run the code below
+    print(f"ERROR: Testing folder not found at: {TEST_DIR}")
     exit()
 
 print(f"Training on data from: {TRAIN_DIR}")
 print(f"Testing on data from: {TEST_DIR}")
 
-# --- LOAD DATA (No splitting parameters) ---
+# --- LOAD DATA ---
 print("Loading Training Data...")
 train_ds = tf.keras.utils.image_dataset_from_directory(
     TRAIN_DIR,
@@ -48,39 +41,54 @@ train_ds = tf.keras.utils.image_dataset_from_directory(
     image_size=(IMG_SIZE, IMG_SIZE),
     batch_size=BATCH_SIZE,
     label_mode='categorical'
-    # Removed: validation_split, subset
 )
 
-print("Load testing data...")
-val_ds = tf.keras.utils.image_dataset_from_directory(
+print("Loading Testing Data...")
+# CHANGED: Variable name is now 'test_ds'
+test_ds = tf.keras.utils.image_dataset_from_directory(
     TEST_DIR,
     seed=123,
     image_size=(IMG_SIZE, IMG_SIZE),
     batch_size=BATCH_SIZE,
-    label_mode='categorical'
-    
+    label_mode='categorical' 
 )
 
 class_names = train_ds.class_names
-print(f"--- CLASS ORDER FOUND: {class_names} ---")
-# Only print if we actually have enough classes to avoid index errors
-for i, name in enumerate(class_names):
-    print(f"{i} = {name}")
+NUM_CLASSES = len(class_names)
+print(f"--- CLASS ORDER: {class_names} ---")
 
-#   optised caching
+# --- CALCULATE CLASS WEIGHTS ---
+print("Computing class weights...")
+train_labels = []
+for images, labels in train_ds:
+    train_labels.extend(np.argmax(labels.numpy(), axis=1))
+
+class_weights_array = class_weight.compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(train_labels),
+    y=train_labels
+)
+class_weights = dict(enumerate(class_weights_array))
+print(f"Weights Applied: {class_weights}")
+
+# --- OPTIMIZATION ---
 AUTOTUNE = tf.data.AUTOTUNE
 train_ds = train_ds.cache().shuffle(1000).prefetch(buffer_size=AUTOTUNE)
-val_ds = val_ds.cache().prefetch(buffer_size=AUTOTUNE)
+test_ds = test_ds.cache().prefetch(buffer_size=AUTOTUNE)
 
-#   alerady augmented so minimal prcesses
+# --- AUGMENTATION ---
 data_augmentation = tf.keras.Sequential([
     layers.RandomFlip("horizontal_and_vertical"),
     layers.RandomRotation(0.1), 
 ])
 
-#   build model
+# --- BUILD MODEL ---
 def build_model():
-    base_model = EfficientNetB0(include_top=False, weights="imagenet", input_shape=(IMG_SIZE, IMG_SIZE, 3))
+    base_model = EfficientNetB0(
+        include_top=False, 
+        weights="imagenet", 
+        input_shape=(IMG_SIZE, IMG_SIZE, 3)
+    )
     base_model.trainable = False
 
     inputs = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
@@ -94,7 +102,6 @@ def build_model():
     model = models.Model(inputs, outputs)
     return model
 
-#   train the model
 print("Building Model...")
 model = build_model()
 
@@ -104,37 +111,51 @@ model.compile(
     metrics=["accuracy"]
 )
 
+# --- TRAINING ---
 print("Starting Training...")
-early_stop = EarlyStopping(monitor='training_loss', patience=5, restore_best_weights=True)
+# NOTE: 'val_loss' is an internal Keras keyword. It MUST stay 'val_loss' 
+# even though we are feeding it testing data.
+early_stop = EarlyStopping(
+    monitor='val_loss', 
+    patience=5, 
+    restore_best_weights=True
+)
 
 history = model.fit(
     train_ds,
-    validation_data=val_ds,
+    validation_data=test_ds, # CHANGED: Passing test_ds here
     epochs=EPOCHS,
-    callbacks=[early_stop]
+    callbacks=[early_stop],
+    class_weight=class_weights
 )
 
-#   save the model
-print("Saving Model...")
-model.save(os.path.join(SCRIPT_DIR, 'soil_classifier_18_12_2025.keras'))
+# --- SAVE MODEL ---
+save_path = os.path.join(SCRIPT_DIR, 'soil_classifier_18_12_2025.keras')
+print(f"Saving Model to {save_path}...")
+model.save(save_path)
 
-#   plot the train, validation data
+# --- PLOTTING ---
+# NOTE: Keras saves metrics as 'val_accuracy' and 'val_loss' regardless of variable names
+acc = history.history['accuracy']
+test_acc = history.history['val_accuracy'] # We assign it to 'test_acc' variable
+loss = history.history['loss']
+test_loss = history.history['val_loss']    # We assign it to 'test_loss' variable
+epochs_range = range(len(acc))
+
 plt.figure(figsize=(12, 4))
 plt.subplot(1, 2, 1)
-plt.plot(history.history['accuracy'], label='Train Accuracy')
-plt.plot(history.history['testing_accuracy'], label='Testing Accuracy')
+plt.plot(epochs_range, acc, label='Train Accuracy')
+plt.plot(epochs_range, test_acc, label='Test Accuracy') # Label on graph
 plt.legend()
 plt.title('Accuracy')
 
 plt.subplot(1, 2, 2)
-plt.plot(history.history['loss'], label='Train Loss')
-plt.plot(history.history['testing_loss'], label='Testing Loss')
+plt.plot(epochs_range, loss, label='Train Loss')
+plt.plot(epochs_range, test_loss, label='Test Loss') # Label on graph
 plt.legend()
 plt.title('Loss')
-plt.savefig(os.path.join(SCRIPT_DIR, 'traningHistory.png')) # Save instead of show for stability
-print("Plot saved ")
-# plt.show() # Uncomment if running locally with a screen
+
+plot_path = os.path.join(SCRIPT_DIR, 'training_history.png')
+plt.savefig(plot_path)
+print(f"Plot saved to {plot_path}")
 print("Done!")
-
-
-#       CLEAN THE CODE, ESPECIALLY FOR CHANGE IN VAL --> TEST 
